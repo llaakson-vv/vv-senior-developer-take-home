@@ -11,7 +11,7 @@ transforms = v2.Compose([
     v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-root = "/home/llaakson/Downloads/MOT15"
+root = "/<path>/<to>/MOT15"
 data_train = create_dataloader(f"{root}/train", transforms=transforms, batch_size=8, shuffle=True)
 data_test = create_dataloader(f"{root}/test", transforms=transforms, batch_size=8, shuffle=False)
 model = construct_model()
