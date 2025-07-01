@@ -8,7 +8,7 @@ from typing import List, Tuple, Dict, Optional
 from torch import Tensor
 
 class PlainGRUTemporalProcessor(nn.Module):
-    """Simple temporal processor using PyTorch's plain GRU (non-convolutional)"""
+    """Simple temporal processor using PyTorch's plain GRU"""
     
     def __init__(self, feature_channels=256, hidden_channels=128, num_layers=1, reduced_channels=1):
         super().__init__()
@@ -20,37 +20,28 @@ class PlainGRUTemporalProcessor(nn.Module):
         # 1x1 convolution to reduce to minimal channels (1 channel by default)
         self.conv_reduce = nn.Conv2d(feature_channels, reduced_channels, kernel_size=1)
         
-        # Plain GRU for temporal processing (operates on flattened features)
-        # Input size is reduced_channels * spatial_size after flattening
+        # GRU for temporal processing 
         self.gru = nn.GRU(
-            input_size=reduced_channels,  # Will be multiplied by spatial size
+            input_size=reduced_channels,
             hidden_size=hidden_channels,
             num_layers=num_layers,
             batch_first=True
         )
         
-        # Feature modulation networks
         self.modulation_net = nn.Sequential(
             nn.Linear(hidden_channels, feature_channels),
             nn.Sigmoid()
         )
         
         self.hidden_state = None
-        self.spatial_size = None  # Store spatial size for GRU input size
+        self.spatial_size = None
     
-    def reset_state(self, batch_size, device):
+    def reset_state(self):
         """Reset hidden state for new sequences"""
         self.hidden_state = None
         self.spatial_size = None
     
     def forward(self, features):
-        """
-        Apply temporal processing to features using plain GRU
-        Args:
-            features: OrderedDict of feature maps from FPN
-        Returns:
-            enhanced_features: OrderedDict with temporally enhanced features
-        """
         if not features:
             return features
         
@@ -62,20 +53,16 @@ class PlainGRUTemporalProcessor(nn.Module):
         device = high_level_features.device
         original_size = high_level_features.shape[2:]
         
-        # Apply 1x1 convolution to reduce to minimal channels
-        reduced_features = self.conv_reduce(high_level_features)  # (B, reduced_channels, H, W)
+        reduced_features = self.conv_reduce(high_level_features)
         
-        # Flatten spatial dimensions for GRU processing
         spatial_size = reduced_features.shape[2] * reduced_features.shape[3]  # H * W
         flattened_features = reduced_features.view(batch_size, self.reduced_channels * spatial_size)  # (B, reduced_channels * H * W)
         
-        # Reshape for GRU: (batch_size, seq_len=1, input_size)
         gru_input = flattened_features.unsqueeze(1)  # (B, 1, reduced_channels * H * W)
         
-        # Update GRU input size if spatial dimensions changed
+        # A fallback init in case I messed up the spacial dimensions :) 
         if self.spatial_size != spatial_size:
             self.spatial_size = spatial_size
-            # Reinitialize GRU with correct input size
             self.gru = nn.GRU(
                 input_size=self.reduced_channels * spatial_size,
                 hidden_size=self.hidden_channels,
@@ -84,31 +71,25 @@ class PlainGRUTemporalProcessor(nn.Module):
             ).to(device)
             self.hidden_state = None
         
-        # Initialize hidden state if needed
         if self.hidden_state is None:
             self.hidden_state = torch.zeros(
                 self.num_layers, batch_size, self.hidden_channels, 
                 device=device, dtype=gru_input.dtype
             )
         
-        # GRU processing
         gru_output, self.hidden_state = self.gru(gru_input, self.hidden_state)
         
-        # Extract output and generate modulation weights
-        temporal_features = gru_output.squeeze(1)  # (B, hidden_channels)
-        modulation = self.modulation_net(temporal_features)  # (B, feature_channels)
+        temporal_features = gru_output.squeeze(1)
+        modulation = self.modulation_net(temporal_features)
         
-        # Reshape modulation to match original feature shape
         modulation = modulation.view(batch_size, self.feature_channels, 1, 1)
         
-        # Upsample modulation to match original feature size
         if original_size != (1, 1):
             modulation = F.interpolate(
                 modulation, size=original_size, 
                 mode='bilinear', align_corners=False
             )
         
-        # Apply temporal modulation to features
         enhanced_features = features.copy()
         enhanced_features[feature_key] = high_level_features * modulation
         
@@ -116,7 +97,11 @@ class PlainGRUTemporalProcessor(nn.Module):
 
 
 class ConvGRUCell(nn.Module):
-    """ConvGRU cell - simpler and more memory efficient alternative to ConvLSTM"""
+    """
+    ConvGRU cell - More intuitive for spatial-temporal data
+    However, for this task, I'll do an aggressive Average Pooling
+    so the temporal features will probably not affect the model training.
+    """
     
     def __init__(self, input_dim, hidden_dim, kernel_size, bias=True):
         super().__init__()
@@ -148,17 +133,14 @@ class ConvGRUCell(nn.Module):
     def forward(self, input_tensor, hidden_state):
         combined = torch.cat([input_tensor, hidden_state], dim=1)
         
-        # Reset and update gates
         combined_conv = self.conv_gates(combined)
         reset_gate, update_gate = torch.split(combined_conv, self.hidden_dim, dim=1)
         reset_gate = torch.sigmoid(reset_gate)
         update_gate = torch.sigmoid(update_gate)
         
-        # New gate with reset applied
         reset_combined = torch.cat([input_tensor, reset_gate * hidden_state], dim=1)
         new_gate = torch.tanh(self.conv_new(reset_combined))
         
-        # Update hidden state
         hidden_new = (1 - update_gate) * new_gate + update_gate * hidden_state
         
         return hidden_new
@@ -176,17 +158,14 @@ class GlobalPoolingTemporalProcessorGRU(nn.Module):
         self.feature_channels = feature_channels
         self.hidden_channels = hidden_channels
         
-        # Global pooling to reduce spatial dimensions
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         
-        # ConvGRU for temporal processing (operates on 1x1 features)
         self.conv_gru = ConvGRUCell(
             input_dim=feature_channels,
             hidden_dim=hidden_channels,
             kernel_size=1  # 1x1 conv since we're working with pooled features
         )
         
-        # Feature modulation networks
         self.modulation_net = nn.Sequential(
             nn.Conv2d(hidden_channels, feature_channels, 1),
             nn.Sigmoid()
@@ -194,18 +173,11 @@ class GlobalPoolingTemporalProcessorGRU(nn.Module):
         
         self.hidden_state = None
     
-    def reset_state(self, batch_size, device):
+    def reset_state(self):
         """Reset hidden state for new sequences"""
         self.hidden_state = None
     
     def forward(self, features):
-        """
-        Apply temporal processing to features using ConvGRU
-        Args:
-            features: OrderedDict of feature maps from FPN
-        Returns:
-            enhanced_features: OrderedDict with temporally enhanced features
-        """
         if not features:
             return features
         
@@ -217,29 +189,24 @@ class GlobalPoolingTemporalProcessorGRU(nn.Module):
         device = high_level_features.device
         original_size = high_level_features.shape[2:]
         
-        # Global pooling to 1x1
+        # Global pooling to 1x1, otherwise, I run out of GPU memory :) 
         pooled_features = self.global_pool(high_level_features)  # (B, C, 1, 1)
         
-        # Initialize hidden state if needed
         if self.hidden_state is None:
             self.hidden_state = self.conv_gru.init_hidden(
                 batch_size, (1, 1), device
             )
         
-        # ConvGRU processing (simpler than LSTM - only one state)
         self.hidden_state = self.conv_gru(pooled_features, self.hidden_state)
         
-        # Generate modulation weights
         modulation = self.modulation_net(self.hidden_state)  # (B, C, 1, 1)
         
-        # Upsample modulation to match original feature size
         if original_size != (1, 1):
             modulation = F.interpolate(
                 modulation, size=original_size, 
                 mode='bilinear', align_corners=False
             )
         
-        # Apply temporal modulation to features
         enhanced_features = features.copy()
         enhanced_features[feature_key] = high_level_features * modulation
         
@@ -496,7 +463,7 @@ class FasterRCNN(GeneralizedRCNN):
 
         super().__init__(backbone, rpn, roi_heads, transform)
         
-        # Add temporal processor (non-invasive)
+        # Add temporal processor
         self.temporal_processor = temporal_processor
 
     def forward(self, images, targets=None):
@@ -594,7 +561,7 @@ class FasterRCNN(GeneralizedRCNN):
         
         # Reset temporal state for new sequences
         if self.temporal_processor:
-            self.temporal_processor.reset_state(batch_size, device)
+            self.temporal_processor.reset_state()
         
         accumulated_losses = {}
         final_detections = None
@@ -666,9 +633,8 @@ def construct_temporal_model_plain_gru(num_classes=5, hidden_channels=128):
     backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1, progress=True, norm_layer=norm_layer)
     backbone = _resnet_fpn_extractor(backbone, trainable_backbone_layers)
 
-    # Create plain GRU temporal processor (most memory efficient)
     temporal_processor = PlainGRUTemporalProcessor(
-        feature_channels=256,  # FPN feature channels
+        feature_channels=256,
         hidden_channels=hidden_channels
     )
 
@@ -694,9 +660,8 @@ def construct_temporal_model_conv_gru(num_classes=5, hidden_channels=128):
     backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1, progress=True, norm_layer=norm_layer)
     backbone = _resnet_fpn_extractor(backbone, trainable_backbone_layers)
 
-    # Create ConvGRU temporal processor (balances memory efficiency and spatial awareness)
     temporal_processor = GlobalPoolingTemporalProcessorGRU(
-        feature_channels=256,  # FPN feature channels
+        feature_channels=256,
         hidden_channels=hidden_channels
     )
 

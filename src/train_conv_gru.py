@@ -18,14 +18,13 @@ def main():
     print(f"Using device: {device}")
     print("Using ConvGRU temporal processor")
 
-    root = "../MOT15"  # Path to MOT15 from src directory
+    root = "path/to/MOT15"  
     data_train = create_dataloader(f"{root}/train", transforms=transforms, batch_size=1, shuffle=True, sequence_length=4)
     data_test = create_dataloader(f"{root}/test", transforms=transforms, batch_size=1, shuffle=False, sequence_length=4)
 
     # Create temporal model with ConvGRU processing
-    model = construct_temporal_model_conv_gru(num_classes=2, hidden_channels=64)
+    model = construct_temporal_model_conv_gru(num_classes=5, hidden_channels=64)
 
-    # Train the model
     model = fit(model, data_train, data_test, device, n_epochs=2, learning_rate=1e-4)
     
     print("ConvGRU training completed successfully!")

@@ -23,10 +23,8 @@ def main():
     data_test = create_dataloader(f"{root}/test", transforms=transforms, batch_size=1, shuffle=False, sequence_length=4)
 
     # Create temporal model with plain GRU processing
-    model = construct_temporal_model_plain_gru(num_classes=2, hidden_channels=64)
-
-    # Train the model
-    model = fit(model, data_train, data_test, device, n_epochs=2, learning_rate=1e-4)
+    model = construct_temporal_model_plain_gru(num_classes=5, hidden_channels=64)
+    model = fit(model, data_train, data_test, device, n_epochs=5, learning_rate=1e-4)
     
     print("Plain GRU training completed successfully!")
     return model
