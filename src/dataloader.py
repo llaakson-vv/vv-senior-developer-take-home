@@ -1,62 +1,104 @@
-import numpy as np
 import os
-from glob import glob
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.io import decode_image
+import numpy as np
+from glob import glob
 
-def read_annotation_file(folder):
-    return open(f"{folder}/det/det.txt", "r").read().split("\n")[:-1]
-
-def parse_annotations(annotations):
-    return np.reshape([np.array(annotation.split(","), np.float32)[:7] for annotation in annotations], (-1, 7))
-
-class MOT15Dataset(Dataset):
-    def __init__(self, data_root, transforms):
-        folders = glob(f"{data_root}/*")
-        self.annotations = [parse_annotations(read_annotation_file(folder)) for folder in folders]
-        self.image_paths = [glob(f"{folder}/img1/*.jpg") for folder in folders]
+class MOTSequenceDataset(Dataset):
+    def __init__(self, data_root, transforms, sequence_length=10):
         self.transforms = transforms
-
-    def get_index_set(self, index):
-        set_lengths = [len(item) for item in self.image_paths]
-        cumulative_lengths = np.concatenate([np.zeros(1), np.cumsum(set_lengths)])
-        idx = np.where(index >= cumulative_lengths)[0][-1]
-        set_index = np.int32(index - cumulative_lengths[idx])
-
-        return self.image_paths[idx][set_index], self.annotations[idx][np.where(self.annotations[idx][:, 0] == (set_index + 1))]
-
-    def get_bbox(self, annotation, x_scale, y_scale):
-        # Annotation fields:
-        # Frame, ID, topleft, width, height, confidence
-        return (annotation[2] * x_scale,
-                annotation[3] * y_scale,
-                (annotation[2] + annotation[4]) * x_scale,
-                (annotation[3] + annotation[5]) * y_scale,)
-
+        self.sequence_length = sequence_length
+        
+        folders = glob(f"{data_root}/*")
+        self.sequences = []
+        
+        for folder in folders:
+            image_paths = sorted(glob(f"{folder}/img1/*.jpg"))
+            annotations = self._read_annotations(folder)
+            
+            for i in range(len(image_paths) - sequence_length + 1):
+                seq_data = {
+                    'images': image_paths[i:i+sequence_length],
+                    'annotations': annotations,
+                    'start_frame': i + 1
+                }
+                self.sequences.append(seq_data)
+    
+    def _read_annotations(self, folder):
+        try:
+            with open(f"{folder}/det/det.txt", "r") as f:
+                lines = f.read().split("\n")[:-1]
+            return np.reshape([np.array(line.split(","), np.float32)[:7] for line in lines], (-1, 7))
+        except:
+            return np.array([]).reshape(0, 7)
+    
+    def _get_frame_targets(self, annotations, frame_num, h_scale, w_scale):
+        frame_annotations = annotations[annotations[:, 0] == frame_num]
+        
+        if len(frame_annotations) == 0:
+            return {
+                "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                "labels": torch.zeros((0,), dtype=torch.int64)
+            }
+        
+        boxes = []
+        for ann in frame_annotations:
+            x1, y1, w, h = ann[2:6]
+            x2, y2 = x1 + w, y1 + h
+            boxes.append([x1 * w_scale, y1 * h_scale, x2 * w_scale, y2 * h_scale])
+        
+        return {
+            "boxes": torch.tensor(boxes, dtype=torch.float32),
+            "labels": torch.ones(len(boxes), dtype=torch.int64)
+        }
+    
     def __len__(self):
-        return np.sum([len(item) for item in self.image_paths])
-
+        return len(self.sequences)
+    
     def __getitem__(self, idx):
-        img_path, annotation = self.get_index_set(idx)
-        image = decode_image(img_path)
-        h_, w_, c_ = np.shape(image)
-        image = self.transforms(image)
-        h, w, c = image.shape
+        seq_data = self.sequences[idx]
+        images = []
+        targets = []
+        
+        for i, img_path in enumerate(seq_data['images']):
+            image = decode_image(img_path)
+            h_orig, w_orig = image.shape[1], image.shape[2]
+            
+            image = self.transforms(image)
+            h_new, w_new = image.shape[1], image.shape[2]
+            
+            frame_num = seq_data['start_frame'] + i
+            frame_targets = self._get_frame_targets(
+                seq_data['annotations'], 
+                frame_num,
+                w_new / w_orig,
+                h_new / h_orig
+            )
+            
+            images.append(image)
+            targets.append(frame_targets)
+        
+        return torch.stack(images), targets
 
-        targets = {"boxes": torch.tensor([self.get_bbox(item, h / h_, w / w_) for item in annotation]).view(-1, 4),
-                   "labels" : torch.tensor([1 for _ in range(len(annotation))]).to(torch.int64)}
-
-        return image, targets
-
-def collate(samples):
-    images = [sample[0] for sample in samples]
-    targets = [sample[1] for sample in samples]
-
-    return images, targets
-
-def create_dataloader(folder, transforms, **kwargs):
-    dataset = MOT15Dataset(folder, transforms)
-
-    return DataLoader(dataset, collate_fn=collate, **kwargs)
+def create_dataloader(folder, transforms, sequence_length=10, batch_size=2, shuffle=True):
+    dataset = MOTSequenceDataset(folder, transforms, sequence_length)
+    
+    def collate_fn(batch):
+        image_sequences = []
+        target_sequences = []
+        
+        for img_seq, tgt_seq in batch:
+            image_sequences.append(img_seq)
+            target_sequences.append(tgt_seq)
+        
+        return torch.stack(image_sequences), target_sequences
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        num_workers=0
+    )
 
